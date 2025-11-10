@@ -32,18 +32,7 @@ def anomaly_score(sample, baseline):
         z_scores[v] = z
     score = max(z_scores.values())
     return score, z_scores
-
-# 3) Turn score into flag
-def anomaly_flag(score, threshold):
-    return 1 if score > threshold else 0
-
-# 4) Update confusion matrix
-def update_confusion_matrix(cm, anomaly, fault_present):
-    if anomaly == 1 and fault_present == 1:
-        cm["TP"] += 1
-    elif anomaly == 0 and fault_present == 0:
-        cm["TN"] += 1
-    elif anomaly == 1 and fault_present == 0:
+ == 0:
         cm["FP"] += 1
     elif anomaly == 0 and fault_present == 1:
         cm["FN"] += 1
