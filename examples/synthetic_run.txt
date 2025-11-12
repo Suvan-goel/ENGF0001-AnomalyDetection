@@ -1,0 +1,36 @@
+Running 800s test, window=120, tau_high=4.0, tau_low=2.0, mahalanobis=True, seed=43
+
+t=0s fault=False type=None score=1.42 flag=0
+t=1s fault=False type=None score=2.08 flag=0
+t=2s fault=False type=None score=2.01 flag=0
+t=3s fault=False type=None score=1.49 flag=0
+t=4s fault=False type=None score=2.30 flag=0
+t=5s fault=False type=None score=1.04 flag=0
+t=6s fault=False type=None score=0.73 flag=0
+t=7s fault=False type=None score=1.90 flag=0
+t=8s fault=False type=None score=0.43 flag=0
+t=9s fault=False type=None score=3.06 flag=0
+t=10s fault=False type=None score=2.23 flag=0
+t=20s fault=False type=None score=1.42 flag=0
+t=30s fault=False type=None score=1.60 flag=0
+t=40s fault=True type=ph_offset_bias score=9.60 flag=1
+t=50s fault=True type=heater_power_loss score=7.62 flag=1
+t=60s fault=True type=therm_voltage_bias score=12.32 flag=1
+t=120s fault=False type=None score=1.56 flag=0
+t=180s fault=False type=None score=1.53 flag=0
+t=240s fault=False type=None score=2.30 flag=0
+t=300s fault=True type=ph_offset_bias score=10.46 flag=1
+t=360s fault=True type=ph_offset_bias score=9.11 flag=1
+t=420s fault=False type=None score=1.66 flag=0
+t=480s fault=False type=None score=3.28 flag=0
+t=540s fault=False type=None score=1.65 flag=0
+t=600s fault=False type=None score=1.50 flag=0
+t=660s fault=False type=None score=1.78 flag=0
+t=720s fault=True type=ph_offset_bias score=9.92 flag=1
+t=780s fault=True type=ph_offset_bias score=10.06 flag=1
+
+=== Summary ===
+TP: 267
+TN: 531
+FP: 2
+FN: 0
