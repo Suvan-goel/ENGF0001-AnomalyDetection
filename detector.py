@@ -23,8 +23,17 @@ import time
 from collections import defaultdict
 from typing import Dict, List, Tuple
 
-import numpy as np
-import paho.mqtt.client as mqtt
+try:
+    import numpy as np
+except Exception:
+    print("Missing dependency: numpy. Install dependencies with:\n  python3 -m pip install -r requirements.txt")
+    sys.exit(1)
+
+try:
+    import paho.mqtt.client as mqtt
+except Exception:
+    mqtt = None
+    print("Optional dependency paho-mqtt not available; MQTT functionality will be disabled.\nInstall with: python3 -m pip install -r requirements.txt")
 
 
 def compute_baseline(samples: List[Dict[str, float]]) -> Dict[str, Dict[str, float]]:
@@ -56,6 +65,59 @@ def anomaly_score(sample: Dict[str, float], baseline: Dict[str, Dict[str, float]
         z_scores[v] = z
     score = max(z_scores.values())
     return score, z_scores
+
+
+def identify_fault_from_zscores(z_scores: Dict[str, float]) -> str:
+    """Return a simple fault name based on the variable with the highest z-score.
+
+    Mapping is heuristic:
+      - 'temperature' -> 'therm_voltage_bias'
+      - 'ph' -> 'ph_offset_bias'
+      - 'rpm' -> 'heater_power_loss'
+
+    Returns empty string if no mapping.
+    """
+    if not z_scores:
+        return ""
+    var = max(z_scores.items(), key=lambda kv: kv[1])[0]
+    mapping = {
+        "temperature": "therm_voltage_bias",
+        "temp": "therm_voltage_bias",
+        "ph": "ph_offset_bias",
+        "rpm": "heater_power_loss",
+    }
+    return mapping.get(var, "")
+
+
+def identify_fault(sample: Dict[str, float], baseline: Dict[str, Dict[str, float]]) -> Tuple[str, Dict[str, float]]:
+    """Compute z-scores and return predicted fault name and z-scores.
+
+    This is a lightweight heuristic useful for optional fault labelling.
+    """
+    score, z_scores = anomaly_score(sample, baseline)
+    fault = identify_fault_from_zscores(z_scores)
+    return fault, z_scores
+
+
+def compute_covariance_baseline(samples: List[Dict[str, float]]):
+    """Compute multivariate mean and inverse covariance for Mahalanobis distance.
+
+    Returns mu (1D array) and invcov (2D array)
+    """
+    vars_ = list(samples[0].keys())
+    arr = np.array([[s[v] for v in vars_] for s in samples], dtype=float)
+    mu = np.mean(arr, axis=0)
+    cov = np.cov(arr, rowvar=False)
+    # regularize if singular
+    cov += np.eye(cov.shape[0]) * 1e-6
+    invcov = np.linalg.inv(cov)
+    return vars_, mu, invcov
+
+
+def mahalanobis_score(sample: Dict[str, float], vars_, mu, invcov) -> float:
+    x = np.array([sample[v] for v in vars_], dtype=float)
+    d2 = float((x - mu).T.dot(invcov).dot(x - mu))
+    return float(np.sqrt(d2))
 
 
 def anomaly_flag(score: float, threshold: float) -> int:
@@ -110,21 +172,41 @@ def extract_sample(msg: dict) -> Dict[str, float]:
 
 class MQTTDetector:
     def __init__(self, broker: str, port: int, topic: str, threshold: float, train_samples: int):
+        # Sliding window config (used to update baseline online)
+        self.window: List[Dict[str, float]] = []
+        self.window_size = train_samples
+        # Hysteresis thresholds (high, low) - high is provided, low defaults to half
+        self.threshold_high = threshold
+        self.threshold_low = threshold * 0.5
+        # Mahalanobis option (can be enabled via CLI)
+        self.use_mahalanobis = False
+        self._maha_vars = None
+        self._maha_mu = None
+        self._maha_invcov = None
+
         self.broker = broker
         self.port = port
         self.topic = topic
         self.threshold = threshold
         self.train_samples = train_samples
 
-        self._client = mqtt.Client()
+        # Message queue (works even if MQTT is not available; allows offline testing)
         self._queue: "queue.Queue[str]" = queue.Queue()
         self._stop = threading.Event()
         self.baseline = None
         self.cm = defaultdict(int)
+        # whether to save artifacts (baseline/confusion) at the end of the run
+        self.save_artifacts = False
 
-        # wire callbacks
-        self._client.on_connect = self._on_connect
-        self._client.on_message = self._on_message
+        # MQTT client is optional; only create if paho-mqtt is installed
+        self.mqtt_enabled = mqtt is not None
+        if self.mqtt_enabled:
+            self._client = mqtt.Client()
+            # wire callbacks
+            self._client.on_connect = self._on_connect
+            self._client.on_message = self._on_message
+        else:
+            self._client = None
 
     def _on_connect(self, client, userdata, flags, rc):
         print(f"Connected to {self.broker}:{self.port} (rc={rc}), subscribing to {self.topic}")
@@ -138,6 +220,9 @@ class MQTTDetector:
             pass
 
     def connect(self):
+        if not self.mqtt_enabled:
+            print("MQTT client not available; run in offline/test mode or install paho-mqtt to enable live mode")
+            return
         self._client.connect(self.broker, self.port, keepalive=60)
         # run network loop in background thread
         t = threading.Thread(target=self._client.loop_forever, daemon=True)
@@ -146,6 +231,7 @@ class MQTTDetector:
     def train(self):
         print(f"Collecting {self.train_samples} training samples from {self.topic}...")
         samples: List[Dict[str, float]] = []
+        self.window = []
         while len(samples) < self.train_samples:
             try:
                 payload = self._queue.get(timeout=5.0)
@@ -156,12 +242,21 @@ class MQTTDetector:
                 msg = json.loads(payload)
                 sample = extract_sample(msg)
                 samples.append(sample)
+                # initialize sliding window with training data
+                self.window.append(sample)
                 if len(samples) % 20 == 0:
                     print(f"  collected {len(samples)}")
             except Exception:
                 # skip malformed
                 continue
         self.baseline = compute_baseline(samples)
+        # also compute Mahalanobis baseline
+        try:
+            self._maha_vars, self._maha_mu, self._maha_invcov = compute_covariance_baseline(samples)
+        except Exception:
+            self._maha_vars = None
+            self._maha_mu = None
+            self._maha_invcov = None
         print("Baseline trained:")
         for k, v in self.baseline.items():
             print(f"  {k}: mu={v['mu']:.3f}, sigma={v['sigma']:.3f}")
@@ -184,12 +279,36 @@ class MQTTDetector:
                 except KeyError:
                     # can't evaluate this message
                     continue
-                score, z = anomaly_score(sample, self.baseline)
-                flag = anomaly_flag(score, self.threshold)
+                # update sliding window
+                self.window.append(sample)
+                if len(self.window) > self.window_size:
+                    self.window.pop(0)
+
+                # compute score using current window baseline (Mahalanobis or univariate)
+                if self.use_mahalanobis and len(self.window) >= 2:
+                    try:
+                        vars_, mu, invcov = compute_covariance_baseline(self.window)
+                        score = mahalanobis_score(sample, vars_, mu, invcov)
+                    except Exception:
+                        score, z = anomaly_score(sample, self.baseline)
+                else:
+                    try:
+                        baseline = compute_baseline(self.window)
+                        score, z = anomaly_score(sample, baseline)
+                    except Exception:
+                        score, z = anomaly_score(sample, self.baseline)
+
+                # dual-threshold hysteresis
+                if score >= self.threshold_high:
+                    flag = 1
+                elif score <= self.threshold_low:
+                    flag = 0
+                else:
+                    flag = getattr(self, '_last_flag', 0)
+                self._last_flag = flag
                 faults = msg.get("faults") or msg.get("active_faults") or []
                 fault_present = 1 if faults else 0
                 update_confusion_matrix(self.cm, flag, fault_present)
-                ts = msg.get("timestamp") or time.time()
                 print(f"[{time.strftime('%H:%M:%S')}] score={score:.2f} flag={flag} faults={faults} sample={sample}")
         except KeyboardInterrupt:
             pass
@@ -200,6 +319,29 @@ class MQTTDetector:
         print("\n=== Detection summary ===")
         for k in ("TP", "TN", "FP", "FN"):
             print(f"{k}: {self.cm[k]}")
+        # optionally persist artifacts
+        if self.save_artifacts:
+            try:
+                import os, json
+                os.makedirs('artifacts', exist_ok=True)
+                # save confusion
+                with open(os.path.join('artifacts', 'confusion.json'), 'w') as f:
+                    json.dump(self.cm, f, indent=2)
+                # save baseline (try window then baseline)
+                baseline_to_save = None
+                try:
+                    if hasattr(self, 'window') and self.window:
+                        baseline_to_save = compute_baseline(self.window)
+                except Exception:
+                    baseline_to_save = None
+                if baseline_to_save is None and self.baseline is not None:
+                    baseline_to_save = self.baseline
+                if baseline_to_save is not None:
+                    with open(os.path.join('artifacts', 'baseline.json'), 'w') as f:
+                        json.dump(baseline_to_save, f, indent=2)
+                print('Artifacts saved to artifacts/')
+            except Exception as e:
+                print('Failed to save artifacts:', e)
 
 
 def main():
@@ -208,10 +350,17 @@ def main():
     p.add_argument("--port", type=int, default=1883, help="MQTT broker port")
     p.add_argument("--topic", default="bioreactor_sim/nofaults/telemetry/summary", help="MQTT topic to subscribe to")
     p.add_argument("--train-samples", type=int, default=120, help="Number of samples to collect for baseline training (seconds)")
-    p.add_argument("--threshold", type=float, default=4.0, help="z-score threshold for anomaly flag")
+    p.add_argument("--threshold", type=float, default=4.0, help="z-score threshold for anomaly flag (high threshold). Low threshold will be half of this by default.")
+    p.add_argument("--threshold-low", type=float, default=None, help="Optional explicit low threshold for hysteresis (if omitted, set to threshold/2)")
+    p.add_argument("--mahalanobis", action="store_true", help="Use Mahalanobis distance (multivariate) instead of max z-score")
     args = p.parse_args()
 
     detector = MQTTDetector(args.broker, args.port, args.topic, args.threshold, args.train_samples)
+    if args.threshold_low is not None:
+        detector.threshold_low = args.threshold_low
+    detector.threshold_high = args.threshold
+    detector.threshold = args.threshold
+    detector.use_mahalanobis = bool(args.mahalanobis)
     detector.connect()
 
     # allow clean shutdown on SIGINT
