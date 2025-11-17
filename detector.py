@@ -158,13 +158,50 @@ def extract_sample(msg: dict) -> Dict[str, float]:
     t = find_value(msg, ["temperature", "temp"])
     ph = find_value(msg, ["ph"])
     rpm = find_value(msg, ["rpm", "stir", "stirring"])
-    if t is None or ph is None or rpm is None:
-        # try nested dicts (some streams nest telemetry under 'telemetry' or 'summary')
+
+    # Some simulator streams send summary objects where the key maps to a dict
+    # with statistics (e.g. 'temperature_C': {'mean': ..., 'min': ..., ...}).
+    # Try to extract numeric means from such structures if direct numeric
+    # values aren't available.
+    if (t is None or ph is None or rpm is None):
+        for k, v in msg.items():
+            if isinstance(v, dict) and 'mean' in v:
+                lk = k.lower()
+                try:
+                    mean_val = float(v['mean'])
+                except Exception:
+                    # sometimes mean itself is nested; skip if not numeric
+                    continue
+                if t is None and ('temp' in lk or 'temperature' in lk):
+                    t = mean_val
+                if ph is None and ('ph' in lk):
+                    ph = mean_val
+                if rpm is None and ('rpm' in lk or 'stir' in lk or 'stirring' in lk):
+                    rpm = mean_val
+
+    # also try nested dicts (some messages place telemetry under 'telemetry' or 'summary')
+    if (t is None or ph is None or rpm is None):
         for k in ("telemetry", "summary", "data"):
             if k in msg and isinstance(msg[k], dict):
-                t = t or find_value(msg[k], ["temperature", "temp"])
-                ph = ph or find_value(msg[k], ["ph"])
-                rpm = rpm or find_value(msg[k], ["rpm", "stir", "stirring"])
+                sub = msg[k]
+                t = t or find_value(sub, ["temperature", "temp"])
+                ph = ph or find_value(sub, ["ph"])
+                rpm = rpm or find_value(sub, ["rpm", "stir", "stirring"])
+                # also attempt summary-mean extraction in nested dict
+                for kk, vv in sub.items():
+                    if isinstance(vv, dict) and 'mean' in vv:
+                        lk = kk.lower()
+                        try:
+                            mean_val = float(vv['mean'])
+                        except Exception:
+                            continue
+                        if t is None and ('temp' in lk or 'temperature' in lk):
+                            t = mean_val
+                        if ph is None and ('ph' in lk):
+                            ph = mean_val
+                        if rpm is None and ('rpm' in lk or 'stir' in lk or 'stirring' in lk):
+                            rpm = mean_val
+
     if t is None or ph is None or rpm is None:
         raise KeyError("Could not extract temperature/ph/rpm from message")
     return {"temperature": float(t), "ph": float(ph), "rpm": float(rpm)}
@@ -215,6 +252,12 @@ class MQTTDetector:
     def _on_message(self, client, userdata, msg):
         try:
             payload = msg.payload.decode("utf-8")
+            # quick server-side debug: log small preview so we know messages arrive
+            try:
+                preview = payload if len(payload) < 200 else payload[:200] + '...'
+                print(f"[MQTT] received on {msg.topic}: {preview}")
+            except Exception:
+                pass
             self._queue.put(payload)
         except Exception:
             pass
