@@ -1,0 +1,6 @@
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial; margin: 16px; }
+.container { max-width: 900px; margin: 0 auto; }
+#controls { margin-bottom: 12px; }
+#controls button { margin-right: 8px; }
+#status { margin-bottom: 12px; }
+canvas { background: #fff; border: 1px solid #eee; margin-bottom: 8px; }

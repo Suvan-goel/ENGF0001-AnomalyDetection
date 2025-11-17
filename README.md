@@ -4,7 +4,7 @@ This repository contains a small, easy-to-run anomaly detector for the ENGF0001
 simulator. It can run either live (subscribe to the simulator's MQTT topics) or
 offline using a built-in synthetic-data test harness.
 
-What the detector does (plain language)
+What the detector does
 - Collect ~N seconds of "normal" data from the simulator (the `nofaults` stream)
   and compute a simple baseline (average and spread) for temperature, pH and RPM.
 - For each new reading, compute how far it is from the baseline. If it is far

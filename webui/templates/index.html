@@ -1,0 +1,51 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ENGF0001 Anomaly Detector — Live UI</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.socket.io/4.6.1/socket.io.min.js"></script>
+  </head>
+  <body>
+    <div class="container">
+      <h1>ENGF0001 Anomaly Detector — Live UI</h1>
+      <div id="controls">
+        <button id="startSynthetic">Start Synthetic</button>
+        <button id="startMQTT">Connect to MQTT</button>
+        <button id="stop">Stop</button>
+
+        <div class="mqtt-controls">
+          <label>Broker: <input id="mqttBroker" type="text" value="engf0001.cs.ucl.ac.uk"></label>
+          <label>Port: <input id="mqttPort" type="number" value="1883"></label>
+          <label>Stream:
+            <select id="mqttStream">
+              <option value="nofaults">nofaults</option>
+              <option value="single_fault">single_fault</option>
+              <option value="three_faults">three_faults</option>
+              <option value="variable_setpoints">variable_setpoints</option>
+            </select>
+          </label>
+          <label>Train samples: <input id="trainSamples" type="number" value="120" min="1" step="1"></label>
+        </div>
+
+        <label>Threshold high: <input id="threshold" type="number" value="4.0" step="0.1"></label>
+        <label>Threshold low: <input id="thresholdLow" type="number" value="2.0" step="0.1"></label>
+        <label><input id="mahalanobis" type="checkbox"> Mahalanobis</label>
+      </div>
+
+      <div id="status">
+        <p id="conn">Status: <span>disconnected</span></p>
+        <p>Score: <span id="score">-</span> Flag: <span id="flag">-</span></p>
+        <p>TP: <span id="tp">0</span> TN: <span id="tn">0</span> FP: <span id="fp">0</span> FN: <span id="fn">0</span></p>
+      </div>
+
+      <canvas id="chartTemp" width="600" height="120"></canvas>
+      <canvas id="chartPH" width="600" height="120"></canvas>
+      <canvas id="chartRPM" width="600" height="120"></canvas>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+  </body>
+</html>
