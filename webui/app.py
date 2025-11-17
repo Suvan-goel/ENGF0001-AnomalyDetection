@@ -18,7 +18,8 @@ from synthetic_test import make_sample, generate_segmented_fault_sequence
 from detector import MQTTDetector
 
 app = Flask(__name__, template_folder='templates', static_folder='static')
-socketio = SocketIO(app, async_mode='eventlet')
+# allow cross-origin (local dev) and enable logging for socket.io
+socketio = SocketIO(app, async_mode='eventlet', cors_allowed_origins='*', logger=True, engineio_logger=False)
 
 
 class StreamController:
@@ -219,12 +220,31 @@ class StreamController:
             self.detector.connect()
         except Exception:
             pass
-        # training
+        # training: emit progress updates to connected clients
         try:
-            self.detector.train()
+            # emit initial status
+            try:
+                socketio.emit('status', {'msg': 'training', 'collected': 0})
+            except Exception:
+                pass
+
+            def progress_cb(n):
+                try:
+                    socketio.emit('status', {'msg': 'training', 'collected': int(n)})
+                except Exception:
+                    pass
+
+            self.detector.train(progress_callback=progress_cb)
+            try:
+                socketio.emit('status', {'msg': 'training_done'})
+            except Exception:
+                pass
         except Exception:
             # training may fail if no MQTT available
-            pass
+            try:
+                socketio.emit('message', {'info': 'training failed or no MQTT data'})
+            except Exception:
+                pass
 
         # initialize window
         self.window = []

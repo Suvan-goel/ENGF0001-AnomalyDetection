@@ -1,4 +1,19 @@
-const socket = io();
+// initialize socket.io client using polling-only transport to avoid websocket upgrade issues
+const socket = io({ transports: ['polling'] });
+
+socket.on('connect', () => {
+  console.log('socket connected, id=', socket.id);
+});
+socket.on('connect_error', (err) => {
+  console.warn('socket connect_error', err);
+  // do not override server status text here; server will emit status events
+});
+socket.on('error', (err) => {
+  console.error('socket error', err);
+});
+socket.on('reconnect_attempt', () => {
+  console.log('socket reconnect attempt');
+});
 
 let running = false;
 let charts = {};
@@ -76,8 +91,19 @@ window.addEventListener('load', () => {
   });
 
   socket.on('status', (m) => {
-    if (m && m.msg) {
-      console.log('status', m.msg);
+    // log entire payload for debugging
+    console.log('status', m);
+    if (!m) return;
+    // show training progress if provided
+    if (m.msg === 'training' && (m.collected !== undefined)) {
+      document.querySelector('#conn span').textContent = `training: ${m.collected}`;
+      return;
+    }
+    if (m.msg === 'training_done') {
+      document.querySelector('#conn span').textContent = 'training done';
+      return;
+    }
+    if (m.msg) {
       document.querySelector('#conn span').textContent = m.msg;
     }
   });

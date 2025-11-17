@@ -228,7 +228,13 @@ class MQTTDetector:
         t = threading.Thread(target=self._client.loop_forever, daemon=True)
         t.start()
 
-    def train(self):
+    def train(self, progress_callback=None):
+        """Collect `train_samples` training samples from the configured topic.
+
+        If `progress_callback` is provided it will be called with the integer
+        number of samples collected so far so callers (e.g. a UI) can report
+        progress back to users.
+        """
         print(f"Collecting {self.train_samples} training samples from {self.topic}...")
         samples: List[Dict[str, float]] = []
         self.window = []
@@ -244,6 +250,12 @@ class MQTTDetector:
                 samples.append(sample)
                 # initialize sliding window with training data
                 self.window.append(sample)
+                # report progress if requested
+                if progress_callback:
+                    try:
+                        progress_callback(len(samples))
+                    except Exception:
+                        pass
                 if len(samples) % 20 == 0:
                     print(f"  collected {len(samples)}")
             except Exception:
