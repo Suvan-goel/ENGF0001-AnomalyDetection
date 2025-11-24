@@ -16,12 +16,56 @@ from __future__ import annotations
 import argparse
 import json
 import queue
+import re
 import signal
 import sys
 import threading
 import time
 from collections import defaultdict
-from typing import Dict, List, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
+
+
+def _normalize_fault_entries(faults: Any) -> List[str]:
+    if faults is None:
+        return []
+    if isinstance(faults, str):
+        return [faults]
+    if isinstance(faults, dict):
+        candidates: List[str] = []
+        for key in ("last_active", "active", "faults", "names"):
+            if key in faults:
+                val = faults[key]
+                if isinstance(val, str):
+                    candidates.append(val)
+                elif isinstance(val, Iterable):
+                    candidates.extend([str(v) for v in val])
+        counts = faults.get("counts") if hasattr(faults, "get") else None
+        if isinstance(counts, dict):
+            for name, count in counts.items():
+                if count:
+                    candidates.append(name)
+        return candidates
+    if isinstance(faults, Iterable):
+        candidates: List[str] = []
+        for item in faults:
+            candidates.extend(_normalize_fault_entries(item))
+        return candidates
+    return [str(faults)]
+
+
+def _fault_list_has_real_issue(faults: Any) -> bool:
+    """Return True if the faults payload contains an actual fault label."""
+    for f in _normalize_fault_entries(faults):
+        try:
+            name = str(f).strip().lower()
+        except Exception:
+            continue
+        if not name:
+            continue
+        if name in {"nofault", "nofaults", "none", "normal", "nominal"}:
+            continue
+        return True
+    return False
 
 try:
     import numpy as np
@@ -135,16 +179,40 @@ def update_confusion_matrix(cm: Dict[str, int], anomaly: int, fault_present: int
         cm["FN"] += 1
 
 
+_STRICT_PREFIX_CANDIDATES = {"ph"}
+
+
+def _tokenize_key(name: str) -> List[str]:
+    tokens = re.split(r"[^a-z0-9]+", name.lower())
+    return [t for t in tokens if t]
+
+
+def _matches_candidate(key: str, candidate: str) -> bool:
+    key_l = key.lower()
+    cand = candidate.lower()
+    if key_l == cand:
+        return True
+    tokens = _tokenize_key(key)
+    if cand in tokens:
+        return True
+    if cand not in _STRICT_PREFIX_CANDIDATES and key_l.startswith(cand):
+        return True
+    return False
+
+
 def find_value(d: dict, candidates: List[str]):
-    """Helper: return first matching numeric value for any key in candidates (case-insensitive)."""
-    lk = {k.lower(): v for k, v in d.items()}
-    for c in candidates:
-        for k, v in lk.items():
-            if c in k:
+    """Helper: return first matching numeric value for any key in candidates (case-insensitive).
+
+    Matches are token-aware to avoid picking unrelated keys (e.g. 'phase' for 'ph').
+    """
+    for key, value in d.items():
+        for candidate in candidates:
+            if _matches_candidate(key, candidate):
                 try:
-                    return float(v)
+                    return float(value)
                 except Exception:
-                    pass
+                    # value may be non-numeric (e.g. dict); keep searching
+                    break
     return None
 
 
@@ -339,19 +407,22 @@ class MQTTDetector:
                 if len(self.window) > self.window_size:
                     self.window.pop(0)
 
-                # compute score using current window baseline (Mahalanobis or univariate)
-                if self.use_mahalanobis and len(self.window) >= 2:
-                    try:
-                        vars_, mu, invcov = compute_covariance_baseline(self.window)
-                        score = mahalanobis_score(sample, vars_, mu, invcov)
-                    except Exception:
-                        score, z = anomaly_score(sample, self.baseline)
-                else:
-                    try:
-                        baseline = compute_baseline(self.window)
-                        score, z = anomaly_score(sample, baseline)
-                    except Exception:
-                        score, z = anomaly_score(sample, self.baseline)
+                # compute score using the trained baseline to avoid drifting towards faults
+                try:
+                    if self.use_mahalanobis and self._maha_vars is not None and self._maha_mu is not None and self._maha_invcov is not None:
+                        score = mahalanobis_score(sample, self._maha_vars, self._maha_mu, self._maha_invcov)
+                    else:
+                        baseline = self.baseline or compute_baseline(self.window)
+                        score, _ = anomaly_score(sample, baseline)
+                except Exception:
+                    fallback_baseline = None
+                    if self.baseline is not None:
+                        fallback_baseline = self.baseline
+                    elif self.window:
+                        fallback_baseline = compute_baseline(self.window)
+                    if fallback_baseline is None:
+                        raise
+                    score, _ = anomaly_score(sample, fallback_baseline)
 
                 # dual-threshold hysteresis
                 if score >= self.threshold_high:
@@ -362,7 +433,7 @@ class MQTTDetector:
                     flag = getattr(self, '_last_flag', 0)
                 self._last_flag = flag
                 faults = msg.get("faults") or msg.get("active_faults") or []
-                fault_present = 1 if faults else 0
+                fault_present = 1 if _fault_list_has_real_issue(faults) else 0
                 update_confusion_matrix(self.cm, flag, fault_present)
                 print(f"[{time.strftime('%H:%M:%S')}] score={score:.2f} flag={flag} faults={faults} sample={sample}")
         except KeyboardInterrupt:

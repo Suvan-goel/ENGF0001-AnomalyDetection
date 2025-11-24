@@ -4,6 +4,7 @@ import time
 import threading
 import json
 import random
+import copy
 
 from flask import Flask, render_template, send_from_directory, request
 from flask_socketio import SocketIO, emit
@@ -13,13 +14,14 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from detector import compute_baseline, compute_covariance_baseline, anomaly_score, mahalanobis_score, update_confusion_matrix, extract_sample
+from detector import compute_baseline, compute_covariance_baseline, anomaly_score, mahalanobis_score, update_confusion_matrix, extract_sample, _fault_list_has_real_issue
 from synthetic_test import make_sample, generate_segmented_fault_sequence
 from detector import MQTTDetector
 
 app = Flask(__name__, template_folder='templates', static_folder='static')
 # allow cross-origin (local dev) and enable logging for socket.io
-socketio = SocketIO(app, async_mode='eventlet', cors_allowed_origins='*', logger=True, engineio_logger=False)
+# use 'threading' async mode for more predictable behaviour during local debugging
+socketio = SocketIO(app, async_mode='threading', cors_allowed_origins='*', logger=True, engineio_logger=False)
 
 
 class StreamController:
@@ -37,6 +39,10 @@ class StreamController:
         self.detector = None
         # persistent synthetic state so stop/start will resume
         self._synthetic_state = None
+        # last telemetry payload seen (for HTTP checks / late clients)
+        self._last_payload = None
+        # store most recent trained baseline so we can reuse it
+        self._trained_artifacts = None
 
     def start_synthetic(self, mtbf=300.0, mttr=60.0, seed=None, window_size=120, threshold_high=4.0, threshold_low=None, mahalanobis=False, resume=True):
         """Start or resume the synthetic producer.
@@ -78,19 +84,19 @@ class StreamController:
         self.thread = socketio.start_background_task(self._synthetic_thread, self._synthetic_state)
         return True
 
-    def start_mqtt(self, broker='engf0001.cs.ucl.ac.uk', port=1883, topic='bioreactor_sim/nofaults/telemetry/summary', train_samples=120, threshold_high=4.0, threshold_low=None, mahalanobis=False):
+    def start_mqtt(self, broker='engf0001.cs.ucl.ac.uk', port=1883, topic='bioreactor_sim/nofaults/telemetry/summary', train_samples=120, threshold_high=4.0, threshold_low=None, mahalanobis=False, skip_training=False):
         if self.running:
             return False
         self.mode = 'mqtt'
         self.running = True
-        self.window_size = train_samples
+        self.window_size = max(1, int(train_samples) if train_samples is not None else 1)
         self.threshold_high = threshold_high
         self.threshold_low = threshold_low if threshold_low is not None else threshold_high * 0.5
         self.use_mahalanobis = mahalanobis
         self.cm = {"TP": 0, "TN": 0, "FP": 0, "FN": 0}
         self._last_flag = 0
         # start as a socketio background task
-        self.thread = socketio.start_background_task(self._mqtt_thread, broker, port, topic, train_samples)
+        self.thread = socketio.start_background_task(self._mqtt_thread, broker, port, topic, train_samples, skip_training)
         return True
 
     def stop(self):
@@ -102,7 +108,16 @@ class StreamController:
 
     def _emit(self, payload):
         # emit to all connected clients
-        socketio.emit('telemetry', payload)
+        try:
+            socketio.emit('telemetry', payload)
+        except Exception:
+            # best-effort emit; ignore if socketio backend not available
+            pass
+        # remember last payload so newly-connected clients can be primed
+        try:
+            self._last_payload = payload
+        except Exception:
+            self._last_payload = None
 
     def _synthetic_thread(self, state):
         # state is a dict containing persistent synthetic state
@@ -213,40 +228,99 @@ class StreamController:
                 self.running = False
                 break
 
-    def _mqtt_thread(self, broker, port, topic, train_samples):
+    def _mqtt_thread(self, broker, port, topic, train_samples, skip_training=False):
         # Start MQTT detector and train
         self.detector = MQTTDetector(broker, port, topic, self.threshold_high, train_samples)
         try:
             self.detector.connect()
         except Exception:
             pass
-        # training: emit progress updates to connected clients
-        try:
-            # emit initial status
+        artifacts = self._trained_artifacts
+        performed_training = False
+        if skip_training and not artifacts:
+            # cannot skip without prior baseline
+            skip_training = False
             try:
-                socketio.emit('status', {'msg': 'training', 'collected': 0})
+                socketio.emit('message', {'info': 'No cached baseline; retraining'})
             except Exception:
                 pass
 
-            def progress_cb(n):
+        if not skip_training:
+            # training: emit progress updates to connected clients
+            try:
                 try:
-                    socketio.emit('status', {'msg': 'training', 'collected': int(n)})
+                    socketio.emit('status', {'msg': 'training', 'collected': 0})
                 except Exception:
                     pass
 
-            self.detector.train(progress_callback=progress_cb)
-            try:
-                socketio.emit('status', {'msg': 'training_done'})
-            except Exception:
-                pass
-        except Exception:
-            # training may fail if no MQTT available
-            try:
-                socketio.emit('message', {'info': 'training failed or no MQTT data'})
-            except Exception:
-                pass
+                def progress_cb(n):
+                    try:
+                        socketio.emit('status', {'msg': 'training', 'collected': int(n)})
+                    except Exception:
+                        pass
 
-        # initialize window
+                self.detector.train(progress_callback=progress_cb)
+                performed_training = True
+                try:
+                    socketio.emit('status', {'msg': 'training_done'})
+                except Exception:
+                    pass
+            except Exception:
+                # training may fail if no MQTT available
+                try:
+                    socketio.emit('message', {'info': 'training failed or no MQTT data'})
+                except Exception:
+                    pass
+        else:
+            # reuse cached baseline
+            try:
+                self.detector.baseline = copy.deepcopy(artifacts.get('baseline'))
+                maha = artifacts.get('maha', {})
+                self.detector._maha_vars = copy.deepcopy(maha.get('vars'))
+                self.detector._maha_mu = copy.deepcopy(maha.get('mu'))
+                self.detector._maha_invcov = copy.deepcopy(maha.get('invcov'))
+                socketio.emit('status', {'msg': 'training_skipped'})
+            except Exception:
+                # fallback to full training if reuse fails
+                try:
+                    socketio.emit('message', {'info': 'failed to load cached baseline, retraining'})
+                except Exception:
+                    pass
+                skip_training = False
+                performed_training = False
+                try:
+                    socketio.emit('status', {'msg': 'training', 'collected': 0})
+                except Exception:
+                    pass
+                self.detector.train()
+                performed_training = True
+                try:
+                    socketio.emit('status', {'msg': 'training_done'})
+                except Exception:
+                    pass
+
+        if performed_training:
+            try:
+                self._trained_artifacts = {
+                    'baseline': copy.deepcopy(self.detector.baseline),
+                    'maha': {
+                        'vars': copy.deepcopy(getattr(self.detector, '_maha_vars', None)),
+                        'mu': copy.deepcopy(getattr(self.detector, '_maha_mu', None)),
+                        'invcov': copy.deepcopy(getattr(self.detector, '_maha_invcov', None)),
+                    }
+                }
+            except Exception:
+                self._trained_artifacts = None
+
+        # cache trained baselines for scoring
+        trained_baseline = getattr(self.detector, 'baseline', None)
+        trained_maha = (
+            getattr(self.detector, '_maha_vars', None),
+            getattr(self.detector, '_maha_mu', None),
+            getattr(self.detector, '_maha_invcov', None),
+        )
+
+        # initialize window (still used for fallbacks / visualization)
         self.window = []
         while self.running:
             try:
@@ -267,16 +341,21 @@ class StreamController:
             if len(self.window) > self.window_size:
                 self.window.pop(0)
 
-            # score
+            # score against the trained baseline to avoid drifting towards faults
             try:
-                if self.use_mahalanobis and len(self.window) >= 2:
-                    vars_, mu, invcov = compute_covariance_baseline(self.window)
-                    score = mahalanobis_score(sample, vars_, mu, invcov)
+                if self.use_mahalanobis:
+                    vars_, mu, invcov = trained_maha
+                    if vars_ is not None and mu is not None and invcov is not None:
+                        score = mahalanobis_score(sample, vars_, mu, invcov)
+                    else:
+                        # fall back to current window if Mahalanobis artifacts missing
+                        vars_, mu, invcov = compute_covariance_baseline(self.window)
+                        score = mahalanobis_score(sample, vars_, mu, invcov)
                 else:
-                    baseline = compute_baseline(self.window)
-                    score, z = anomaly_score(sample, baseline)
+                    baseline = trained_baseline or compute_baseline(self.window)
+                    score, _ = anomaly_score(sample, baseline)
             except Exception:
-                score, z = anomaly_score(sample, compute_baseline(self.window))
+                score, _ = anomaly_score(sample, compute_baseline(self.window))
 
             # hysteresis
             if score >= self.threshold_high:
@@ -287,7 +366,8 @@ class StreamController:
                 flag = self._last_flag
             self._last_flag = flag
 
-            update_confusion_matrix(self.cm, flag, 1 if msg.get('faults') else 0)
+            fault_present = 1 if _fault_list_has_real_issue(msg.get('faults') or []) else 0
+            update_confusion_matrix(self.cm, flag, fault_present)
 
             payload_out = {
                 'sample': sample,
@@ -311,6 +391,13 @@ def index():
 @socketio.on('connect')
 def handle_connect():
     emit('status', {'msg': 'connected'})
+    # if we have a recent telemetry payload, send it to the newly-connected client
+    try:
+        lp = getattr(controller, '_last_payload', None)
+        if lp is not None:
+            emit('telemetry', lp)
+    except Exception:
+        pass
 
 
 @socketio.on('start_synthetic')
@@ -330,6 +417,7 @@ def handle_start_synthetic(data):
 
 @socketio.on('start_mqtt')
 def handle_start_mqtt(data):
+    print('Received start_mqtt request:', data)
     broker = data.get('broker') or 'engf0001.cs.ucl.ac.uk'
     port = int(data.get('port') or 1883)
     topic = data.get('topic', 'bioreactor_sim/nofaults/telemetry/summary')
@@ -341,6 +429,34 @@ def handle_start_mqtt(data):
     mahalanobis = bool(data.get('mahalanobis', False))
     controller.start_mqtt(broker=broker, port=port, topic=topic, train_samples=train_samples, threshold_high=tau_h, threshold_low=tau_l, mahalanobis=mahalanobis)
     emit('status', {'msg': 'mqtt_started'})
+
+
+@app.route('/last')
+def last_payload():
+    """Return the last emitted telemetry payload as JSON for quick checks.
+
+    Useful when socket.io polling is unreliable — you can `curl /last`
+    to confirm the server has data.
+    """
+    lp = getattr(controller, '_last_payload', None)
+    # log the request so we can see if HTTP hits the server
+    try:
+        print(f"HTTP /last requested, last_payload={'present' if lp is not None else 'none'}")
+    except Exception:
+        pass
+    if lp is None:
+        return (json.dumps({'ok': False, 'msg': 'no payload yet'}), 200, {'Content-Type': 'application/json'})
+    return (json.dumps({'ok': True, 'payload': lp}), 200, {'Content-Type': 'application/json'})
+
+
+@app.route('/ping')
+def ping():
+    """Lightweight health endpoint to validate HTTP responsiveness."""
+    try:
+        print('HTTP /ping requested')
+    except Exception:
+        pass
+    return ('ok', 200)
 
 
 @socketio.on('stop')
@@ -357,6 +473,7 @@ def artifacts(filename):
 if __name__ == '__main__':
     # run with eventlet; allow overriding port via PORT env var
     port = int(os.environ.get('PORT', '5000'))
+    print(f"Starting web server on 0.0.0.0:{port} (async_mode={socketio.async_mode})")
     try:
         socketio.run(app, host='0.0.0.0', port=port)
     except OSError as e:
