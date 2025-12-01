@@ -1,0 +1,2 @@
+numpy>=1.23
+paho-mqtt>=1.6
